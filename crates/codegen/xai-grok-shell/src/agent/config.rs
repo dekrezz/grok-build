@@ -2337,31 +2337,23 @@ impl Config {
         if let Some(mode) = self.features.telemetry {
             return Resolved::new(mode, ConfigSource::Config);
         }
-        if let Some(rs) = self.remote_settings.as_ref() {
-            if let Some(mode_str) = rs.telemetry_mode.as_deref()
-                && let Some(mode) = TelemetryMode::parse(mode_str)
-            {
-                return Resolved::new(mode, ConfigSource::Remote);
-            }
-            if let Some(val) = rs.telemetry_enabled {
-                return Resolved::new(TelemetryMode::from(val), ConfigSource::Remote);
-            }
-        }
+        // Remote activation removed. Upstream consulted `remote_settings`
+        // (`telemetry_mode` / `telemetry_enabled`, server-delivered) here, so the
+        // backend could switch telemetry on for a client that never asked for it
+        // locally. Only explicit local intent -- an admin requirement,
+        // `GROK_TELEMETRY_ENABLED`, or `[features] telemetry` -- can leave the
+        // disabled default now. See NO-TELEMETRY.md.
         Resolved::new(TelemetryMode::Disabled, ConfigSource::Default)
     }
     pub(crate) fn resolve_trace_upload(&self) -> Resolved<bool> {
         let mode = self.resolve_telemetry_mode();
-        let ff = if mode.value.is_disabled() {
-            None
-        } else {
-            self.remote_settings
-                .as_ref()
-                .and_then(|s| s.trace_upload_enabled)
-        };
+        // Session traces carry prompts and file contents, so remote activation is
+        // removed here too: upstream a server-delivered `trace_upload_enabled`
+        // flag could start uploading them. Uploads now need a local opt-in.
         BoolFlag::env("GROK_TELEMETRY_TRACE_UPLOAD")
             .requirement(self.requirements.trace_upload.pinned())
             .config(self.telemetry.trace_upload)
-            .feature_flag(ff)
+            .feature_flag(None)
             .default(mode.value.is_enabled())
             .resolve()
     }

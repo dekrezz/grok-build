@@ -481,14 +481,24 @@ Keyboard shortcuts are **not** configurable — all bindings are built in. See [
 
 ### Telemetry
 
+> **This build has vendor telemetry removed.** Product analytics no longer exist:
+> the Mixpanel client and the xAI product-events POST were deleted from the
+> source, Sentry crash reporting is inert, and no analytics endpoint or credential
+> can be baked in at build time. The backend can also no longer switch telemetry
+> or trace uploads on remotely — only explicit local config does anything.
+> See `NO-TELEMETRY.md` at the repository root.
+>
+> The knobs below still parse, so existing config files keep working, but the
+> analytics ones have no send path behind them.
+
 These are independent knobs (see [Monitoring Usage](24-monitoring-usage.md#related-settings)):
 
-- **`[features] telemetry`** / `GROK_TELEMETRY_ENABLED` — the product-analytics master switch. `/privacy` doesn't change it.
-- **Coding data, retention, and training** — the Settings row `/privacy` opens; coding-data sharing, separate from telemetry.
-- **`[telemetry] trace_upload`** / `GROK_TELEMETRY_TRACE_UPLOAD` — session traces; follows telemetry when unset.
-- **`[telemetry] otel_*`** / `GROK_EXTERNAL_OTEL` — external OTEL to your own collector (below).
+- **`[features] telemetry`** / `GROK_TELEMETRY_ENABLED` — historically the product-analytics master switch. Now inert: turning it on collects nothing and sends nothing.
+- **Coding data, retention, and training** — the Settings row `/privacy` opens; coding-data sharing, separate from telemetry. Defaults to opt-out.
+- **`[telemetry] trace_upload`** / `GROK_TELEMETRY_TRACE_UPLOAD` — session traces, which carry prompts and file contents. Off by default, needs an explicit local opt-in, and can no longer be enabled from the server.
+- **`[telemetry] otel_*`** / `GROK_EXTERNAL_OTEL` — external OTEL to **your own** collector (below). Deliberately left intact: off by default, and only ever sends where you point it.
 
-When telemetry is on, enterprises running their own collector can redirect it or turn parts off under `[telemetry]`:
+The `events_url` / `events_api_key` / `mixpanel_*` keys are still accepted for backwards compatibility, but nothing reads them — the code that posted to them is gone:
 
 ```toml
 [telemetry]
@@ -498,7 +508,7 @@ mixpanel_enabled = false                                  # disable Mixpanel pro
 trace_upload = false                                      # disable session/trace uploads (inherits the telemetry toggle when unset)
 ```
 
-Set these only to point telemetry at your own infrastructure or to switch parts off. The built-in endpoint and credentials are managed by Grok — leave them unset to use the defaults.
+If you want usage data for your own infrastructure, use the external OpenTelemetry stream below rather than these keys.
 
 The same `[telemetry]` table also configures the **external OpenTelemetry stream**, an independent opt-in (it doesn't require the telemetry toggle above) that ships a curated, content-free usage schema to your *own* OTLP collector. Collector auth comes from `OTEL_EXPORTER_OTLP_HEADERS` and is never stored on disk. See [Monitoring & Usage](24-monitoring-usage.md) for the full schema, env vars, and privacy model.
 

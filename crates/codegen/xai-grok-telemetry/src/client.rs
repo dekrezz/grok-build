@@ -1,55 +1,29 @@
-//! Core telemetry tracking — product events + Mixpanel.
+//! Core telemetry tracking — outbound analytics removed.
 //!
-//! All calls route through [`track`]. Precedence: env > config > remote config > default.
+//! Upstream this module posted every event twice: to xAI's product-events
+//! endpoint and to Mixpanel. Both send paths are deleted, so [`track`] now
+//! assembles nothing that leaves the machine. See NO-TELEMETRY.md.
 //!
-//! Extracted from `xai-grok-shell::agent::telemetry::track`. The HTTP client is
-//! injected via [`init`]/[`init_if_needed`] so this crate avoids depending on
-//! shell's `User-Agent` builder (which couples to the `permission` module).
+//! The module and its public API are kept because the rest of the tree calls
+//! into them (`is_enabled`, `session_metrics`, the local logs) and the mode
+//! contract is still meaningful for local-only behaviour.
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 
 use chrono::{Local, SecondsFormat};
 use serde_json::json;
-use xai_mixpanel::Mixpanel;
 
 use crate::config::{TelemetryConfig, TelemetryMode, deployment_id_from_key};
 use crate::http::OriginClientInfo;
-use crate::session_ctx::EmitterOrigin;
 
 /// Event property map shared by all telemetry modules.
 pub type Metadata = serde_json::Map<String, serde_json::Value>;
 
-/// Derive the analytics `event_value` from the full wire `event_name` by stripping
-/// whichever [`EmitterOrigin`] prefix it carries (`grok-shell-` /
-/// `grok-workspace-`). Unprefixed names pass through unchanged. Kept in
-/// lockstep with [`EmitterOrigin::event_prefix`] via [`EmitterOrigin::ALL`],
-/// so shell events keep their historical stripped value and workspace events
-/// collapse to the same bare suffix.
-fn event_value(event_name: &str) -> &str {
-    for origin in EmitterOrigin::ALL {
-        if let Some(suffix) = event_name.strip_prefix(origin.event_prefix()) {
-            return suffix;
-        }
-    }
-    event_name
-}
 
-/// Product-analytics `$insert_id`: unique per emit, ≤36 bytes, `[A-Za-z0-9-]`.
-///
-/// Do not put the event name in this field. The analytics sink truncates to 36
-/// chars and rejects most other characters; a name-prefixed id either collapses
-/// to a constant (long names → per-user same-second dedup) or is dropped and
-/// regenerated (shorter names with `:`). A bare UUID always validates.
-fn product_analytics_insert_id() -> String {
-    uuid::Uuid::new_v4().simple().to_string()
-}
 
 #[derive(Clone)]
 pub struct TelemetryClient {
     mode: TelemetryMode,
-    events_url: Option<String>,
-    events_api_key: Option<String>,
-    mixpanel: Option<Arc<Mixpanel>>,
     user_id: Option<String>,
     team_id: Option<String>,
     deployment_id: Option<String>,
@@ -57,18 +31,14 @@ pub struct TelemetryClient {
     client_type: Option<String>,
     client_version: Option<String>,
     subscription_tier: Option<String>,
-    http_client: reqwest::Client,
 }
 
 impl std::fmt::Debug for TelemetryClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The previous impl printed the analytics endpoint and a masked API key.
+        // Neither is stored any more, so the mode is all there is to report.
         f.debug_struct("TelemetryClient")
-            .field("events_url", &self.events_url)
-            .field(
-                "events_api_key",
-                &self.events_api_key.as_ref().map(|_| "***"),
-            )
-            .field("mixpanel", &self.mixpanel.as_ref().map(|_| "configured"))
+            .field("mode", &self.mode)
             .finish()
     }
 }
@@ -83,16 +53,15 @@ impl TelemetryClient {
         origin_client: Option<OriginClientInfo>,
         shell_version: String,
         subscription_tier: Option<String>,
-        http_client: reqwest::Client,
+        _http_client: reqwest::Client,
     ) -> Self {
-        let mixpanel = if config.mixpanel_enabled {
-            config
-                .mixpanel_token
-                .as_ref()
-                .map(|token| Arc::new(Mixpanel::new(token.as_str())))
-        } else {
-            None
-        };
+        // `config`'s analytics fields (`events_url`, `events_api_key`,
+        // `mixpanel_token`, `mixpanel_enabled`) are deliberately ignored: no
+        // Mixpanel client and no events POST exist in this build. They remain on
+        // `TelemetryConfig` so existing config files and env vars still parse.
+        // `_http_client` is unused too; the parameter stays so callers in
+        // shell/pager compile unchanged.
+        let _ = &config;
         let deployment_id = deployment_key
             .filter(|s| !s.is_empty())
             .map(|k| deployment_id_from_key(&k));
@@ -103,9 +72,6 @@ impl TelemetryClient {
 
         Self {
             mode,
-            events_url: config.events_url,
-            events_api_key: config.events_api_key,
-            mixpanel,
             user_id,
             team_id,
             deployment_id,
@@ -113,7 +79,6 @@ impl TelemetryClient {
             client_type,
             client_version,
             subscription_tier: subscription_tier.map(|t| normalize_tier(&t)),
-            http_client,
         }
     }
 }
@@ -179,7 +144,11 @@ impl UserContext {
     }
 }
 
-/// Core telemetry emitter. Routes to product events + Mixpanel.
+/// Core telemetry emitter — now a sink with no outbound route.
+///
+/// Kept as the single funnel every caller already uses, so events stay
+/// centralised and nothing changes at the call sites. Both send paths (xAI
+/// product events, Mixpanel) were removed.
 pub async fn track(event_name: &str, request_id: &str, ctx: &UserContext, mut metadata: Metadata) {
     let lock = TELEMETRY_CLIENT.get_or_init(|| Mutex::new(None));
     let client = {
@@ -210,59 +179,14 @@ pub async fn track(event_name: &str, request_id: &str, ctx: &UserContext, mut me
         metadata.insert("subscription_tier".into(), json!(subscription_tier));
     }
 
-    // Product events path
-    if let (Some(url), Some(api_key)) = (&client.events_url, &client.events_api_key) {
-        let body = json!({
-            "viewer_context": {
-                "request_id": request_id,
-                "user_attributes": {
-                    "user_id": user_id,
-                    "user_type": "LoggedIn",
-                    "country": ctx.country,
-                    "language": ctx.language,
-                    "locale": "English",
-                },
-                "device_attributes": {
-                    "app_name": "Grok Code",
-                },
-            },
-            "api_key": api_key,
-            "events": [{
-                "event_name": event_name,
-                "event_value": event_value(event_name),
-                "event_metadata": metadata.clone(),
-                "timestamp": ctx.timestamp,
-            }]
-        });
-        let _ = client
-            .http_client
-            .post(url)
-            .header("x-api-key", api_key.as_str())
-            .timeout(std::time::Duration::from_secs(10))
-            .json(&body)
-            .send()
-            .await;
-    }
-
-    // Mixpanel path
-    if let Some(ref mixpanel) = client.mixpanel {
-        let time_secs = chrono::Utc::now().timestamp();
-        let insert_id = product_analytics_insert_id();
-
-        // Convert serde_json::Map to HashMap for mixpanel
-        let mut props: std::collections::HashMap<String, serde_json::Value> =
-            metadata.into_iter().collect();
-        props.insert("distinct_id".into(), json!(user_id));
-        props.insert("time".into(), json!(time_secs));
-        props.insert("$insert_id".into(), json!(insert_id));
-        props.insert("app_name".into(), json!("Grok Code"));
-        props.insert("user_type".into(), json!("LoggedIn"));
-        props.insert("country".into(), json!(ctx.country));
-        props.insert("language".into(), json!(ctx.language));
-        props.insert("locale".into(), json!("English"));
-
-        let _ = mixpanel.track(event_name, Some(props)).await;
-    }
+    // ─── Outbound analytics removed ───────────────────────────────────────
+    //
+    // Upstream this POSTed each event twice: to xAI's product-events endpoint
+    // (`events_url` + `x-api-key`) and to Mixpanel's `/track` API. Both send
+    // paths are deleted, so no event ever leaves the machine. The metadata above
+    // is still assembled because the local debug/unified logs consume the same
+    // shape; here it is simply dropped.
+    let _ = (event_name, request_id, user_id, &metadata, ctx);
 }
 
 /// Sync the user's Mixpanel profile once per init. Fire-and-forget.
@@ -286,35 +210,16 @@ pub fn sync_profile() {
         return;
     }
 
-    let Some(mixpanel) = client.mixpanel.clone() else {
-        return;
-    };
-
-    let agent_id = crate::id::agent_id();
-    let user_id = client.user_id.as_deref().unwrap_or(&agent_id).to_owned();
-
-    tokio::spawn(async move {
-        let mut props = std::collections::HashMap::new();
-        props.insert("agent_id".into(), json!(agent_id));
-        props.insert("shell_version".into(), json!(client.shell_version));
-        props.insert("app_name".into(), json!("Grok Code"));
-        if let Some(ref client_type) = client.client_type {
-            props.insert("client_type".into(), json!(client_type));
-        }
-        if let Some(ref client_version) = client.client_version {
-            props.insert("client_version".into(), json!(client_version));
-        }
-        if let Some(ref deployment_id) = client.deployment_id {
-            props.insert("deployment_id".into(), json!(deployment_id));
-        }
-        if let Some(ref team_id) = client.team_id {
-            props.insert("team_id".into(), json!(team_id));
-        }
-        if let Some(ref subscription_tier) = client.subscription_tier {
-            props.insert("subscription_tier".into(), json!(subscription_tier));
-        }
-        let _ = mixpanel.engage(&user_id, props).await;
-    });
+    // ─── Profile sync removed ─────────────────────────────────────────────
+    //
+    // Upstream this spawned a Mixpanel `engage` call that created/updated a user
+    // profile keyed by `agent_id` (or the authenticated user id) with shell
+    // version, client type/version, deployment id, team id and subscription
+    // tier. That is the identity-building half of the analytics pipeline, so it
+    // is gone entirely -- no profile is written anywhere.
+    //
+    // The mode gate above is kept so the call stays a cheap early return and the
+    // `Enabled`-only contract remains documented and tested.
 }
 
 /// Initialize telemetry client. Safe to call multiple times.
@@ -400,22 +305,7 @@ pub fn init_if_needed(
 mod tests {
     use super::*;
 
-    /// Shell events must still strip to their bare suffix, byte-for-byte
-    /// identical to the previous `strip_prefix("grok-shell-")` behavior.
-    #[test]
-    fn event_value_strips_shell_prefix() {
-        assert_eq!(event_value("grok-shell-turn"), "turn");
-        assert_eq!(
-            event_value("grok-shell-trace_upload_attempted"),
-            "trace_upload_attempted"
-        );
-    }
 
-    /// Workspace events strip their own prefix to the same bare suffix.
-    #[test]
-    fn event_value_strips_workspace_prefix() {
-        assert_eq!(event_value("grok-workspace-turn"), "turn");
-    }
 
     /// SessionMetrics must not attempt Mixpanel profile engage — sync_profile
     /// is a no-op unless mode is fully Enabled.
@@ -467,30 +357,8 @@ mod tests {
         assert!(!is_enabled(), "product analytics must stay off");
     }
 
-    /// Names without a known emitter prefix pass through unchanged (preserves
-    /// the old `unwrap_or(event_name)` fallback).
-    #[test]
-    fn event_value_passes_through_unprefixed() {
-        assert_eq!(event_value("turn"), "turn");
-        assert_eq!(event_value(""), "");
-    }
 
-    /// Only the leading emitter prefix is stripped; a suffix that itself looks
-    /// like another prefix is left intact.
-    #[test]
-    fn event_value_strips_only_leading_prefix() {
-        assert_eq!(event_value("grok-shell-workspace-x"), "workspace-x");
-    }
 
-    /// The stripper recovers the bare suffix for every origin the emitter can
-    /// produce — ties `event_value` to `EmitterOrigin::event_prefix`.
-    #[test]
-    fn event_value_round_trips_every_emitter_prefix() {
-        for origin in EmitterOrigin::ALL {
-            let name = format!("{}my_event", origin.event_prefix());
-            assert_eq!(event_value(&name), "my_event");
-        }
-    }
 
     /// Mixpanel `subscription_tier` must be a stable snake_case key. Free
     /// users arrive as CCP display `"Free"` or JWT-fallback `"free"`; both
@@ -513,26 +381,4 @@ mod tests {
         assert_eq!(normalize_tier("api_key"), "api_key");
     }
 
-    /// `event_value`'s first-match-wins over `EmitterOrigin::ALL` is only
-    /// correct because the emitter prefixes are mutually exclusive: no origin's
-    /// `event_prefix()` is a prefix of another's. If that invariant ever broke
-    /// (e.g. a future `"grok-shell-ext-"` origin), an earlier `ALL` entry could
-    /// strip a shorter prefix first and yield the wrong `event_value`. Pin the
-    /// invariant so adding such a variant fails the suite rather than silently
-    /// corrupting analytics.
-    #[test]
-    fn emitter_prefixes_are_mutually_exclusive() {
-        for a in EmitterOrigin::ALL {
-            for b in EmitterOrigin::ALL {
-                if a != b {
-                    assert!(
-                        !a.event_prefix().starts_with(b.event_prefix()),
-                        "{a:?} prefix {:?} must not start with {b:?} prefix {:?}",
-                        a.event_prefix(),
-                        b.event_prefix(),
-                    );
-                }
-            }
-        }
-    }
 }

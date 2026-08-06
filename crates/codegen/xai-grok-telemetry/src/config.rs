@@ -116,33 +116,22 @@ pub struct TelemetryConfig {
     /// External OTEL content gate (admins can pin to `false` via requirements).
     pub otel_log_tool_details: Option<bool>,
 }
-fn internal_defaults() -> (Option<String>, Option<String>, Option<String>, bool) {
-    (None, None, None, false)
-}
-fn build_env_default(value: Option<&'static str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned)
-}
 impl Default for TelemetryConfig {
+    /// No analytics sink is ever configured by default.
+    ///
+    /// Upstream read three compile-time bakes here --
+    /// `GROK_TELEMETRY_BUILD_EVENTS_URL`, `GROK_TELEMETRY_BUILD_EVENTS_API_KEY`
+    /// and `GROK_TELEMETRY_BUILD_MIXPANEL_TOKEN` -- via `option_env!`, letting a
+    /// release build ship with a live endpoint and credentials embedded in the
+    /// binary. Those bakes are removed: the fields are hardcoded empty so no
+    /// build can embed an analytics destination. See NO-TELEMETRY.md.
     fn default() -> Self {
-        let (baked_url, baked_key, baked_token, baked_enabled) = internal_defaults();
-        let build_url = build_env_default(option_env!("GROK_TELEMETRY_BUILD_EVENTS_URL"));
-        let build_key = build_env_default(option_env!("GROK_TELEMETRY_BUILD_EVENTS_API_KEY"));
-        let build_token = build_env_default(option_env!("GROK_TELEMETRY_BUILD_MIXPANEL_TOKEN"));
-        let mixpanel_enabled = baked_enabled || build_token.is_some();
-        let (events_url, events_api_key, mixpanel_token) = (
-            build_url.or(baked_url),
-            build_key.or(baked_key),
-            build_token.or(baked_token),
-        );
         Self {
             enabled: None,
-            events_url,
-            events_api_key,
-            mixpanel_token,
-            mixpanel_enabled,
+            events_url: None,
+            events_api_key: None,
+            mixpanel_token: None,
+            mixpanel_enabled: false,
             trace_upload: None,
             otel_enabled: None,
             otel_metrics_exporter: None,
@@ -216,22 +205,22 @@ pub fn deployment_id_from_key(key: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Guards the de-telemetry invariant: the default config must never carry an
+    /// analytics destination, whatever was set in the build environment.
+    /// Rebuilding with `GROK_TELEMETRY_BUILD_*` exported must not change these --
+    /// if someone reintroduces an `option_env!` bake, this fails.
     #[test]
-    fn build_env_default_normalizes() {
-        assert_eq!(build_env_default(None), None);
-        assert_eq!(build_env_default(Some("")), None);
-        assert_eq!(build_env_default(Some(" \t ")), None);
-        assert_eq!(build_env_default(Some(" key ")), Some("key".to_owned()));
-    }
-    #[test]
-    fn default_is_build_env_layer_when_feature_off() {
+    fn default_never_configures_an_analytics_sink() {
         let cfg = TelemetryConfig::default();
-        let url = build_env_default(option_env!("GROK_TELEMETRY_BUILD_EVENTS_URL"));
-        let key = build_env_default(option_env!("GROK_TELEMETRY_BUILD_EVENTS_API_KEY"));
-        let token = build_env_default(option_env!("GROK_TELEMETRY_BUILD_MIXPANEL_TOKEN"));
-        assert_eq!(cfg.mixpanel_enabled, token.is_some());
-        assert_eq!(cfg.events_url, url);
-        assert_eq!(cfg.events_api_key, key);
-        assert_eq!(cfg.mixpanel_token, token);
+        assert_eq!(cfg.events_url, None, "events_url must never be baked in");
+        assert_eq!(
+            cfg.events_api_key, None,
+            "events_api_key must never be baked in"
+        );
+        assert_eq!(
+            cfg.mixpanel_token, None,
+            "mixpanel_token must never be baked in"
+        );
+        assert!(!cfg.mixpanel_enabled, "mixpanel must never default to on");
     }
 }

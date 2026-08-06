@@ -267,7 +267,8 @@ pub async fn connect_via_leader(
 
     let mut agent_config = AgentConfig::new_from_toml_cfg(raw_config)
         .map_err(|e| anyhow::anyhow!("Failed to create agent config: {e}"))?;
-    // resolve_telemetry_mode reads remote_settings.
+    // remote_settings still drives other resolves; telemetry is no longer one of
+    // them (remote activation was removed -- see NO-TELEMETRY.md).
     agent_config.remote_settings = flags.remote_settings.clone();
 
     let client_type = flags
